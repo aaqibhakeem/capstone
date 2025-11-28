@@ -1,0 +1,4 @@
+torch
+kafka-python
+jsonschema
+numpy

@@ -1,67 +1,81 @@
-import sys
-import os
-import time
+# evaluate.py
+import argparse
+import json
+from kafka import KafkaConsumer, KafkaProducer
+from datetime import datetime, timezone, timedelta
 
-def normalize(pwd: str) -> str:
-    return pwd.strip().lower()
+ISO_TZ = timezone(timedelta(hours=5, minutes=30))  # IST
 
-def run_file_evaluator(dataset_id):
-    #############################################
-    # Config
-    #############################################
-    TESTSET_PATH = f"./testset_{dataset_id}.txt"
-    GUESSES_PATH = f"./guesses_{dataset_id}.txt"
+def load_testset(path):
+    """Load testset lines into a lowercase set."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return {line.strip().lower() for line in f if line.strip()}
+    except FileNotFoundError:
+        print(f"Testset file not found: {path}")
+        return set()
 
-    #############################################
-    # Load test set
-    #############################################
-    if not os.path.exists(TESTSET_PATH):
-        print(f"❌ Test set file not found: {TESTSET_PATH}")
-        return
-    with open(TESTSET_PATH, "r", encoding="utf-8") as f:
-        test_passwords = set(normalize(line) for line in f if line.strip())
-    print(f"✅ Loaded {len(test_passwords)} passwords for {dataset_id}")
+def publish_result(producer, dataset, correct, total, done):
+    rate = correct / total if total else 0.0
+    msg = {
+        "dataset": dataset,
+        "correct": correct,
+        "total": total,
+        "rate": rate,
+        "done": done,
+        "ts": datetime.now(ISO_TZ).isoformat(timespec="seconds")
+    }
+    producer.send("results", msg)
+    producer.flush()
 
-    #############################################
-    # Load guesses
-    #############################################
-    if not os.path.exists(GUESSES_PATH):
-        print(f"❌ Guesses file not found: {GUESSES_PATH}")
-        return
-    with open(GUESSES_PATH, "r", encoding="utf-8") as f:
-        guesses = [normalize(line) for line in f if line.strip()]
-    print(f"✅ Loaded {len(guesses)} guesses for {dataset_id}")
+def evaluate(dataset, kafka_bootstrap="localhost:9092"):
+    test_file = f"testset_{dataset}.txt"
+    gt = load_testset(test_file)
 
-    #############################################
-    # Simulated Kafka-style evaluation loop
-    #############################################
-    total_guesses = 0
-    matches = 0
+    print(f"Evaluating guesses for {dataset}...")
 
-    print(f"🔍 Evaluator for {dataset_id} running...")
+    consumer = KafkaConsumer(
+        f"guesses_{dataset}",
+        bootstrap_servers=kafka_bootstrap,
+        auto_offset_reset="earliest",
+        enable_auto_commit=False,
+        consumer_timeout_ms=5000,
+        value_deserializer=lambda v: json.loads(v.decode("utf-8"))
+    )
 
-    for guess in guesses:
-        total_guesses += 1
-        if guess in test_passwords:
-            matches += 1
+    producer = KafkaProducer(
+        bootstrap_servers=kafka_bootstrap,
+        value_serializer=lambda v: json.dumps(v).encode("utf-8")
+    )
 
-        if total_guesses % 100 == 0:
-            match_rate = matches / total_guesses
-            print(f"[{dataset_id}] guesses={total_guesses}, matches={matches}, rate={match_rate:.4f}")
+    seen = set()
+    correct = 0
+    total = 0
 
-        # tiny delay to simulate streaming
-        time.sleep(0.001)
+    for msg in consumer:
+        val = msg.value
+        pwd = val.get("guess", "").strip().lower()
 
-    #############################################
-    # Final result
-    #############################################
-    match_rate = matches / total_guesses if total_guesses > 0 else 0.0
-    print(f"\n✅ Final results for {dataset_id}: guesses={total_guesses}, matches={matches}, rate={match_rate:.4f}")
+        # Only count unique guesses
+        if pwd not in seen:
+            seen.add(pwd)
+            total += 1
+
+            if pwd in gt:
+                correct += 1
+
+            # Publish incremental update
+            publish_result(producer, dataset, correct, total, False)
+
+    # Final snapshot
+    publish_result(producer, dataset, correct, total, True)
+
+    print(f"Evaluation finished for {dataset}: {correct}/{total} matched.")
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python evaluate.py <ds1|ds2|ds3>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Evaluate matching rate for guesses.")
+    parser.add_argument("--dataset", required=True, choices=["ds1", "ds2", "ds3"])
+    parser.add_argument("--kafka", default="localhost:9092")
+    args = parser.parse_args()
 
-    dataset_id = sys.argv[1]
-    run_file_evaluator(dataset_id)
+    evaluate(args.dataset, args.kafka)

@@ -1,35 +1,53 @@
+# result.py
 import json
 from kafka import KafkaConsumer
 
+# Consumer listens to the "results" topic
 consumer = KafkaConsumer(
     "results",
     bootstrap_servers="localhost:9092",
     auto_offset_reset="earliest",
-    group_id="aggregator",
-    value_deserializer=lambda v: json.loads(v.decode("utf-8"))
+    group_id="results_aggregator",
+    value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+    max_poll_records=1000
 )
 
-print("📊 Results Aggregator running...")
-
-# Track cumulative stats
+# Tracking per dataset
 stats = {
-    "ds1": {"matches": 0, "total": 0},
-    "ds2": {"matches": 0, "total": 0},
-    "ds3": {"matches": 0, "total": 0},
+    "ds1": {"correct": 0, "total": 0},
+    "ds2": {"correct": 0, "total": 0},
+    "ds3": {"correct": 0, "total": 0}
 }
 
+print("Result aggregator running (listening on 'results' topic)...")
+
 for msg in consumer:
-    result = msg.value
-    ds = result["dataset"]
+    res = msg.value
+    ds = res.get("dataset")
 
-    stats[ds]["matches"] += result["matches"]
-    stats[ds]["total"] += result["total"]
+    if ds not in stats:
+        stats[ds] = {"correct": 0, "total": 0}
 
-    # Calculate per-dataset and overall rates
-    match_rate_ds = stats[ds]["matches"] / stats[ds]["total"] if stats[ds]["total"] > 0 else 0.0
+    # update stats from message
+    stats[ds]["correct"] = res.get("correct", stats[ds]["correct"])
+    stats[ds]["total"] = res.get("total", stats[ds]["total"])
 
-    overall_matches = sum(s["matches"] for s in stats.values())
-    overall_total = sum(s["total"] for s in stats.values())
-    overall_rate = overall_matches / overall_total if overall_total > 0 else 0.0
+    # compute per-dataset rates
+    per_ds = {
+        k: (v["correct"] / v["total"]) if v["total"] else 0.0
+        for k, v in stats.items()
+    }
 
-    print(f"📌 Dataset {ds} → Match rate: {match_rate_ds:.4%}")
+    # compute overall
+    overall_correct = sum(v["correct"] for v in stats.values())
+    overall_total = sum(v["total"] for v in stats.values())
+    overall_rate = (overall_correct / overall_total) if overall_total else 0.0
+
+    # clean output
+    print(
+        f"Rates → "
+        f"ds1={per_ds['ds1']:.4%}, "
+        f"ds2={per_ds['ds2']:.4%}, "
+        f"ds3={per_ds['ds3']:.4%} | "
+        f"overall={overall_rate:.4%}"
+    )
